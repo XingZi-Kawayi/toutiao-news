@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 from config.config import get_db
 from utils.ai_service import ai_service, LLMAuthError, LLMRateLimitError, LLMServiceError
 from utils.auth import get_current_user
 from models.users import User
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,14 @@ class KeywordsRequest(BaseModel):
 
 class KeywordsResponse(BaseModel):
     keywords: List[str]
+
+
+class SentimentRequest(BaseModel):
+    content: str = Field(..., description="文本内容", max_length=10000)
+
+
+class SentimentResponse(BaseModel):
+    sentiment: str
 
 
 def handle_llm_error(func):
@@ -102,7 +112,7 @@ async def ai_chat(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """AI 对话"""
+    """AI 对话（非流式）"""
     response = await ai_service.chat(request.messages)
     
     if not response:
@@ -115,6 +125,41 @@ async def ai_chat(
             "response": response
         }
     }
+
+
+@router.post("/chat/stream")
+async def ai_chat_stream(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """AI 对话（流式响应 SSE）"""
+    async def generate():
+        try:
+            async for chunk in ai_service.chat_stream(request.messages):
+                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except LLMAuthError:
+            logger.error("LLM authentication error")
+            yield f"data: {json.dumps({'error': 'AI 服务配置错误'}, ensure_ascii=False)}\n\n"
+        except LLMRateLimitError:
+            logger.warning("LLM rate limit exceeded")
+            yield f"data: {json.dumps({'error': '请求过于频繁'}, ensure_ascii=False)}\n\n"
+        except LLMServiceError as e:
+            logger.error(f"LLM service error: {e}")
+            yield f"data: {json.dumps({'error': 'AI 服务暂时不可用'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"Unexpected error in stream: {e}")
+            yield f"data: {json.dumps({'error': '生成失败'}, ensure_ascii=False)}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @router.post("/keywords")
@@ -131,6 +176,27 @@ async def extract_keywords(
         "message": "提取关键词成功",
         "data": {
             "keywords": keywords
+        }
+    }
+
+
+@router.post("/sentiment")
+@handle_llm_error
+async def analyze_sentiment(
+    request: SentimentRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """情感分析"""
+    sentiment = await ai_service.analyze_sentiment(request.content)
+    
+    if not sentiment:
+        raise HTTPException(status_code=500, detail="情感分析失败，请稍后重试")
+    
+    return {
+        "code": 200,
+        "message": "情感分析成功",
+        "data": {
+            "sentiment": sentiment
         }
     }
 

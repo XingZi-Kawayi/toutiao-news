@@ -35,18 +35,10 @@ class CacheManager:
                     decode_responses=True,
                     socket_connect_timeout=2.0
                 )
-                asyncio.create_task(self._test_redis_connection())
+                logger.info("Redis cache initialized (connection will be tested on first use)")
             except Exception as e:
                 logger.warning(f"Failed to initialize Redis client: {e}, falling back to in-memory cache")
                 self._use_redis = False
-    
-    async def _test_redis_connection(self):
-        try:
-            await self._redis_client.ping()
-            logger.info("Redis cache initialized and connected")
-        except Exception as e:
-            logger.warning(f"Failed to connect to Redis: {e}, falling back to in-memory cache")
-            self._use_redis = False
     
     async def close(self):
         if self._redis_client:

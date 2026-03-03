@@ -1,5 +1,6 @@
 import httpx
-from typing import List, Optional
+import hashlib
+from typing import List, Optional, AsyncGenerator
 import json
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
@@ -101,15 +102,66 @@ class AIService:
             logger.error(f"LLM API call failed after retries: {e}")
             return None
     
+    async def _call_llm_stream(self, messages: List[dict]) -> AsyncGenerator[str, None]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream(
+                "POST",
+                self.endpoint,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "X-DashScope-SSE": "enable"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": True
+                }
+            ) as response:
+                if response.status_code == 401:
+                    raise LLMAuthError("Invalid API key")
+                elif response.status_code == 429:
+                    raise LLMRateLimitError("Rate limit exceeded")
+                elif response.status_code >= 500:
+                    raise LLMServiceError(f"Server error: {response.status_code}")
+                
+                response.raise_for_status()
+                
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if data_str and data_str != "[DONE]":
+                            try:
+                                data = json.loads(data_str)
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    delta = data["choices"][0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        yield content
+                            except json.JSONDecodeError:
+                                continue
+    
     async def generate_summary(self, content: str, max_length: int = 200) -> Optional[str]:
         messages = [
             {
                 "role": "system",
-                "content": "你是一个专业的新闻编辑，请为新闻内容生成简洁准确的摘要。"
+                "content": """你是一位资深的新闻编辑专家，擅长从复杂的新闻内容中提炼核心信息。
+
+任务要求：
+1. 生成不超过{max_length}字的摘要
+2. 必须包含：时间、地点、关键人物、核心事件、影响/结果
+3. 使用客观、中立的新闻语言
+4. 避免使用模糊表述和主观判断
+5. 摘要结构应该符合"倒金字塔"结构
+
+输出格式要求：
+- 只输出摘要正文，不要任何前缀、后缀或说明
+- 不要使用Markdown格式
+- 保持段落连贯"""
             },
             {
                 "role": "user",
-                "content": f"请为以下新闻内容生成一个不超过{max_length}字的摘要，只输出摘要内容，不要有其他说明：\n\n{content}"
+                "content": f"请为以下新闻内容生成一个不超过{max_length}字的摘要：\n\n{content}"
             }
         ]
         
@@ -132,7 +184,19 @@ class AIService:
     async def chat(self, messages: List[dict]) -> Optional[str]:
         system_message = {
             "role": "system",
-            "content": "你是一个专业的新闻助手，可以帮助用户了解新闻、解答问题。回答要简洁明了，有条理。"
+            "content": """你是一个专业的新闻助手，名叫"头条AI助手"。
+
+你的职责：
+1. 帮助用户了解新闻时事，解答相关问题
+2. 回答要简洁明了，有条理
+3. 保持客观中立的态度
+4. 如果问题超出新闻领域，礼貌地说明你的专长范围
+5. 引用信息时尽量注明来源（如果知道）
+
+回答风格：
+- 专业但友好
+- 使用清晰的要点或段落
+- 避免过于技术性的术语"""
         }
         messages_with_system = [system_message] + messages
         
@@ -141,11 +205,40 @@ class AIService:
             return result["choices"][0]["message"]["content"].strip()
         return None
     
+    async def chat_stream(self, messages: List[dict]) -> AsyncGenerator[str, None]:
+        system_message = {
+            "role": "system",
+            "content": """你是一个专业的新闻助手，名叫"头条AI助手"。
+
+你的职责：
+1. 帮助用户了解新闻时事，解答相关问题
+2. 回答要简洁明了，有条理
+3. 保持客观中立的态度
+4. 如果问题超出新闻领域，礼貌地说明你的专长范围
+5. 引用信息时尽量注明来源（如果知道）
+
+回答风格：
+- 专业但友好
+- 使用清晰的要点或段落
+- 避免过于技术性的术语"""
+        }
+        messages_with_system = [system_message] + messages
+        
+        async for chunk in self._call_llm_stream(messages_with_system):
+            yield chunk
+    
     async def extract_keywords(self, content: str, top_k: int = 5) -> List[str]:
         messages = [
             {
                 "role": "system",
-                "content": "你是一个专业的内容分析师，请从文本中提取关键词。"
+                "content": """你是一个专业的内容分析师，擅长从文本中提取高质量关键词。
+
+关键词提取标准：
+1. 选择最能代表文本主题的词语
+2. 优先选择名词和专有名词
+3. 避免使用过于通用的词汇（如"的"、"是"、"和"等）
+4. 关键词应该具有检索价值
+5. 按重要性排序输出"""
             },
             {
                 "role": "user",
@@ -174,11 +267,20 @@ class AIService:
         messages = [
             {
                 "role": "system",
-                "content": "你是一个情感分析专家，请判断文本的情感倾向。"
+                "content": """你是一个专业的情感分析专家。
+
+情感判断标准：
+- 正面：内容积极向上，传达希望、喜悦、成功等情绪
+- 负面：内容消极悲观，传达失望、悲伤、失败等情绪
+- 中性：内容客观中立，无明显情感倾向
+
+输出要求：
+- 只输出'正面'、'负面'或'中性'中的一个
+- 不要有任何其他说明文字"""
             },
             {
                 "role": "user",
-                "content": f"请判断以下新闻的情感倾向，只输出'正面'、'负面'或'中性'中的一个：\n\n{content}"
+                "content": f"请判断以下新闻的情感倾向：\n\n{content}"
             }
         ]
         
@@ -197,9 +299,6 @@ class AIService:
                 await self.cache.set(cache_key, sentiment)
             return sentiment
         return None
-
-
-import hashlib
 
 
 ai_service = AIService()

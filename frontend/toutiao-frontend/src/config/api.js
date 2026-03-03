@@ -10,12 +10,6 @@ export const apiConfig = {
 }
 
 export const aiChatConfig = {
-  // OpenAI API地址
-  apiEndpoint: import.meta.env.VITE_AI_API_ENDPOINT || 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-  
-  // API Key (由开发人员指定)
-  apiKey: import.meta.env.VITE_AI_API_KEY || '',
-  
-  // 使用的模型
-  model: import.meta.env.VITE_AI_MODEL || 'qwen3-max-preview'
+  // 后端AI聊天API地址（流式）
+  apiEndpoint: `${apiConfig.baseURL}/api/ai/chat/stream`,
 }
