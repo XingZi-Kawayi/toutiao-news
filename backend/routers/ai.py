@@ -3,9 +3,12 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from config.config import get_db
-from utils.ai_service import ai_service
+from utils.ai_service import ai_service, LLMAuthError, LLMRateLimitError, LLMServiceError
 from utils.auth import get_current_user
 from models.users import User
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/api/ai", tags=["AI 服务"])
@@ -39,7 +42,39 @@ class KeywordsResponse(BaseModel):
     keywords: List[str]
 
 
+def handle_llm_error(func):
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except LLMAuthError:
+            logger.error("LLM authentication error")
+            raise HTTPException(
+                status_code=500,
+                detail="AI 服务配置错误，请联系管理员"
+            )
+        except LLMRateLimitError:
+            logger.warning("LLM rate limit exceeded")
+            raise HTTPException(
+                status_code=429,
+                detail="请求过于频繁，请稍后再试"
+            )
+        except LLMServiceError as e:
+            logger.error(f"LLM service error: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail="AI 服务暂时不可用，请稍后重试"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error in LLM call: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="生成失败，请稍后重试"
+            )
+    return wrapper
+
+
 @router.post("/summary")
+@handle_llm_error
 async def generate_summary(
     request: SummaryRequest,
     db: AsyncSession = Depends(get_db)
@@ -62,6 +97,7 @@ async def generate_summary(
 
 
 @router.post("/chat")
+@handle_llm_error
 async def ai_chat(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db)
@@ -82,6 +118,7 @@ async def ai_chat(
 
 
 @router.post("/keywords")
+@handle_llm_error
 async def extract_keywords(
     request: KeywordsRequest,
     db: AsyncSession = Depends(get_db)
@@ -99,13 +136,13 @@ async def extract_keywords(
 
 
 @router.get("/news/{news_id}/summary")
+@handle_llm_error
 async def get_news_summary(
     news_id: int,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
     """获取新闻摘要（需要登录）"""
-    # 这里需要从数据库获取新闻内容，简化处理
     from crud import news as news_crud
     news_detail = await news_crud.get_news_detail(db, news_id)
     

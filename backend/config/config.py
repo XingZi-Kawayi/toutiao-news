@@ -31,6 +31,20 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
+# LLM 配置
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+DASHSCOPE_ENDPOINT = os.getenv("DASHSCOPE_ENDPOINT", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3-max-preview")
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "30.0"))
+
+# Redis 配置
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "86400"))
+
+
 # 依赖项，用于获取数据库会话
 async def get_db():
     async with AsyncSessionLocal() as session:

@@ -1,25 +1,71 @@
 import httpx
 from typing import List, Optional
 import json
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+from config.config import (
+    DASHSCOPE_API_KEY,
+    DASHSCOPE_ENDPOINT,
+    DEFAULT_MODEL,
+    LLM_TIMEOUT,
+    CACHE_TTL,
+    REDIS_HOST,
+    REDIS_PORT,
+    REDIS_PASSWORD,
+    REDIS_DB
+)
+from utils.cache import init_cache, get_cache
 
-# AI 服务配置
-DASHSCOPE_API_KEY = "sk-9c4d89982a6a4bd3b7494d94751fe81c"
-DASHSCOPE_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-DEFAULT_MODEL = "qwen3-max-preview"
+logger = logging.getLogger(__name__)
+
+
+class LLMError(Exception):
+    pass
+
+
+class LLMAuthError(LLMError):
+    pass
+
+
+class LLMRateLimitError(LLMError):
+    pass
+
+
+class LLMServiceError(LLMError):
+    pass
 
 
 class AIService:
-    """AI 服务类 - 封装通义千问 API 调用"""
-    
     def __init__(self):
         self.api_key = DASHSCOPE_API_KEY
         self.endpoint = DASHSCOPE_ENDPOINT
         self.model = DEFAULT_MODEL
+        self.timeout = LLM_TIMEOUT
+        self._init_cache()
+    
+    def _init_cache(self):
+        try:
+            init_cache(
+                redis_host=REDIS_HOST,
+                redis_port=REDIS_PORT,
+                redis_password=REDIS_PASSWORD,
+                redis_db=REDIS_DB,
+                default_ttl=CACHE_TTL
+            )
+            self.cache = get_cache()
+        except Exception as e:
+            logger.warning(f"Failed to initialize cache: {e}")
+            self.cache = None
     
     async def _call_llm(self, messages: List[dict], stream: bool = False) -> Optional[dict]:
-        """调用 LLM API"""
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=4),
+            retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.RequestError)),
+            before_sleep=before_sleep_log(logger, logging.WARNING)
+        )
+        async def _make_request():
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
                     self.endpoint,
                     headers={
@@ -32,14 +78,30 @@ class AIService:
                         "stream": stream
                     }
                 )
+                
+                if response.status_code == 401:
+                    raise LLMAuthError("Invalid API key")
+                elif response.status_code == 429:
+                    raise LLMRateLimitError("Rate limit exceeded")
+                elif response.status_code >= 500:
+                    raise LLMServiceError(f"Server error: {response.status_code}")
+                
                 response.raise_for_status()
                 return response.json()
-            except Exception as e:
-                print(f"LLM API 调用失败：{e}")
-                return None
+        
+        try:
+            return await _make_request()
+        except LLMAuthError as e:
+            logger.error(f"LLM auth error: {e}")
+            raise
+        except LLMRateLimitError as e:
+            logger.warning(f"LLM rate limit: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"LLM API call failed after retries: {e}")
+            return None
     
     async def generate_summary(self, content: str, max_length: int = 200) -> Optional[str]:
-        """生成新闻摘要"""
         messages = [
             {
                 "role": "system",
@@ -51,13 +113,23 @@ class AIService:
             }
         ]
         
+        cache_key = f"summary:{hashlib.md5((content + str(max_length)).encode()).hexdigest()}"
+        
+        if self.cache:
+            cached = await self.cache.get(cache_key)
+            if cached:
+                logger.debug("Summary cache hit")
+                return cached
+        
         result = await self._call_llm(messages)
         if result and "choices" in result and len(result["choices"]) > 0:
-            return result["choices"][0]["message"]["content"].strip()
+            summary = result["choices"][0]["message"]["content"].strip()
+            if self.cache and summary:
+                await self.cache.set(cache_key, summary)
+            return summary
         return None
     
     async def chat(self, messages: List[dict]) -> Optional[str]:
-        """通用对话"""
         system_message = {
             "role": "system",
             "content": "你是一个专业的新闻助手，可以帮助用户了解新闻、解答问题。回答要简洁明了，有条理。"
@@ -70,7 +142,6 @@ class AIService:
         return None
     
     async def extract_keywords(self, content: str, top_k: int = 5) -> List[str]:
-        """提取关键词"""
         messages = [
             {
                 "role": "system",
@@ -82,14 +153,24 @@ class AIService:
             }
         ]
         
+        cache_key = f"keywords:{hashlib.md5((content + str(top_k)).encode()).hexdigest()}"
+        
+        if self.cache:
+            cached = await self.cache.get(cache_key)
+            if cached:
+                logger.debug("Keywords cache hit")
+                return cached
+        
         result = await self._call_llm(messages)
         if result and "choices" in result and len(result["choices"]) > 0:
             keywords_str = result["choices"][0]["message"]["content"].strip()
-            return [kw.strip() for kw in keywords_str.split(",") if kw.strip()]
+            keywords = [kw.strip() for kw in keywords_str.split(",") if kw.strip()]
+            if self.cache and keywords:
+                await self.cache.set(cache_key, keywords)
+            return keywords
         return []
     
     async def analyze_sentiment(self, content: str) -> Optional[str]:
-        """情感分析"""
         messages = [
             {
                 "role": "system",
@@ -101,11 +182,24 @@ class AIService:
             }
         ]
         
+        cache_key = f"sentiment:{hashlib.md5(content.encode()).hexdigest()}"
+        
+        if self.cache:
+            cached = await self.cache.get(cache_key)
+            if cached:
+                logger.debug("Sentiment cache hit")
+                return cached
+        
         result = await self._call_llm(messages)
         if result and "choices" in result and len(result["choices"]) > 0:
-            return result["choices"][0]["message"]["content"].strip()
+            sentiment = result["choices"][0]["message"]["content"].strip()
+            if self.cache and sentiment:
+                await self.cache.set(cache_key, sentiment)
+            return sentiment
         return None
 
 
-# 创建全局 AI 服务实例
+import hashlib
+
+
 ai_service = AIService()
