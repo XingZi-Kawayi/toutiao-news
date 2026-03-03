@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, AsyncGenerator
+from functools import wraps
 from sqlalchemy.ext.asyncio import AsyncSession
 from config.config import get_db
 from utils.ai_service import ai_service, LLMAuthError, LLMRateLimitError, LLMServiceError
@@ -53,6 +54,7 @@ class SentimentResponse(BaseModel):
 
 
 def handle_llm_error(func):
+    @wraps(func)
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
@@ -128,10 +130,7 @@ async def ai_chat(
 
 
 @router.post("/chat/stream")
-async def ai_chat_stream(
-    request: ChatRequest,
-    db: AsyncSession = Depends(get_db)
-):
+async def ai_chat_stream(request: ChatRequest):
     """AI 对话（流式响应 SSE）"""
     async def generate():
         try:
@@ -149,7 +148,7 @@ async def ai_chat_stream(
             yield f"data: {json.dumps({'error': 'AI 服务暂时不可用'}, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.error(f"Unexpected error in stream: {e}")
-            yield f"data: {json.dumps({'error': '生成失败'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'error': '生成失败: ' + str(e)}, ensure_ascii=False)}\n\n"
     
     return StreamingResponse(
         generate(),
@@ -157,7 +156,9 @@ async def ai_chat_stream(
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*"
         }
     )
 
